@@ -1,0 +1,74 @@
+import jax
+import jax.numpy as jnp
+import pytest
+
+from pendulumcontrol import (
+    OptimalControlPretraining,
+    PendulumSimulation,
+    PolicyGradientTraining,
+    ProximalPolicyTraining,
+    SimulationGradientTraining,
+    StateControl,
+    StateControlAgent,
+    animate_simulation,
+    integrator_path,
+    is_stabilized,
+    plot_training,
+    run_training,
+    simulate,
+)
+
+KEY = jax.random.key(0)
+SIMULATION = PendulumSimulation()
+AGENT = StateControlAgent(StateControl(KEY, hidden_size=16))
+INITIAL_STATE = jnp.array([0.0, 0.2, 0.0, 0.0])
+
+
+def test_agent_force_stays_within_limit():
+    trajectory = simulate(AGENT, SIMULATION, INITIAL_STATE, 20, KEY)
+    assert trajectory.states.shape == (21, 4)
+    assert jnp.all(jnp.abs(trajectory.applied_forces) <= AGENT.max_force)
+
+
+@pytest.mark.parametrize(
+    "method",
+    [
+        OptimalControlPretraining(
+            updates=2, train_state_count=8, test_state_count=4, batch_size=4
+        ),
+        PolicyGradientTraining(updates=2, trajectory_count=4, steps=10, test_steps=10),
+        ProximalPolicyTraining(updates=2, trajectory_count=4, steps=10, test_steps=10),
+        SimulationGradientTraining(
+            updates=2, trajectory_count=4, steps=10, test_steps=10
+        ),
+    ],
+)
+def test_training_method_changes_network(method, tmp_path):
+    trained, histories = run_training(AGENT, SIMULATION, [method], KEY)
+    network_input = AGENT.network_input(INITIAL_STATE)
+    assert trained.network(network_input) != AGENT.network(network_input)
+    plot_training(histories, tmp_path / "training.png")
+    assert (tmp_path / "training.png").exists()
+
+
+def test_policy_gradient_learns_to_stabilize():
+    trained, _ = PolicyGradientTraining(updates=1500).train(
+        StateControlAgent(StateControl(KEY)), SIMULATION, KEY
+    )
+    trajectory = simulate(trained, SIMULATION, INITIAL_STATE, 100)
+    assert is_stabilized(trajectory, trained.target_state)
+
+
+def test_integrator_path_applies_force_only_during_pulses():
+    trajectory = simulate(AGENT, SIMULATION, INITIAL_STATE, 3)
+    times, states, forces = integrator_path(trajectory, SIMULATION)
+    steps = SIMULATION.integrator_steps_per_control
+    assert len(times) == len(states) == len(forces) == 3 * steps
+    assert jnp.all(forces[SIMULATION.integrator_steps_with_force : steps] == 0)
+    assert jnp.allclose(states[steps], trajectory.states[1])
+
+
+def test_animation_is_written(tmp_path):
+    trajectory = simulate(AGENT, SIMULATION, INITIAL_STATE, 10)
+    animate_simulation(trajectory, AGENT, SIMULATION, tmp_path / "simulation.gif")
+    assert (tmp_path / "simulation.gif").exists()
