@@ -204,6 +204,8 @@ class TrajectoryTraining(ABC):
     learning_rate: float = 3e-4
     gradient_limit: float = 1.0
     evaluation_interval: int = 5
+    angle_tolerance: float = 0.1
+    angular_velocity_tolerance: float = 0.5
 
     @property
     def optimizer_steps_per_update(self) -> int:
@@ -266,10 +268,17 @@ class TrajectoryTraining(ABC):
         self, batch: Trajectory, target: jax.Array
     ) -> tuple[jax.Array, jax.Array]:
         step_costs = jax.vmap(Trajectory.step_costs, (0, None, None))
-        stabilized = jax.vmap(is_stabilized, (0, None))
+        stabilized = jax.vmap(is_stabilized, (0, None, None, None))
         return (
             jnp.mean(step_costs(batch, self.cost, target)),
-            jnp.mean(stabilized(batch, target)),
+            jnp.mean(
+                stabilized(
+                    batch,
+                    target,
+                    self.angle_tolerance,
+                    self.angular_velocity_tolerance,
+                )
+            ),
         )
 
     def train(

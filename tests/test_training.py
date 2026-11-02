@@ -53,6 +53,14 @@ def test_training_method_changes_network(method, tmp_path):
     assert (tmp_path / "training.png").exists()
 
 
+def test_tap_force_rounds_applied_force():
+    agent = StateControlAgent(StateControl(KEY), max_force=500.0, tap_force=50.0)
+    forces = jnp.array([20.0, 30.0, -80.0, 900.0])
+    assert jnp.allclose(
+        jax.vmap(agent.limit_force)(forces), jnp.array([0.0, 50.0, -100.0, 500.0])
+    )
+
+
 def test_policy_gradient_learns_to_stabilize():
     trained, _ = PolicyGradientTraining(updates=1500).train(
         StateControlAgent(StateControl(KEY)), SIMULATION, KEY

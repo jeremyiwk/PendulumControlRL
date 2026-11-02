@@ -42,6 +42,7 @@ class StateControlAgent(eqx.Module):
     )
     max_force: float = 50.0
     exploration_noise: float = 0.2
+    tap_force: float | None = None
 
     def network_input(self, state: jax.Array) -> jax.Array:
         error = state - self.target_state
@@ -59,7 +60,10 @@ class StateControlAgent(eqx.Module):
         return -0.5 * ((sampled - self.control(state)) / noise_scale) ** 2
 
     def limit_force(self, force: jax.Array) -> jax.Array:
-        return jnp.clip(force, -self.max_force, self.max_force)
+        force = jnp.clip(force, -self.max_force, self.max_force)
+        if self.tap_force is None:
+            return force
+        return self.tap_force * jnp.round(force / self.tap_force)
 
     def with_network(self, network: StateControl) -> "StateControlAgent":
         return eqx.tree_at(lambda agent: agent.network, self, network)

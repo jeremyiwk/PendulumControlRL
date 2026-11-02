@@ -4,6 +4,11 @@
 
 ![Training cost, share of runs stabilized, and sampled train and test states over policy gradient training](reports/stabilize_pendulum/training.png)
 
+These plots use one 0.005 s force pulse every 0.55 s. The network trains with force limited to
+500 N, and the simulation rounds its force to multiples of 50 N, so small corrections become no
+tap at all and the wobble stays visible. These settings are in `scripts/stabilize_pendulum.py`.
+The library default is one pulse of up to 50 N every 0.1 s, with no rounding.
+
 A neural network learns to balance an inverted pendulum on a moving fulcrum, using JAX,
 Equinox and Diffrax. The network maps the state directly to a force on the fulcrum along x.
 
