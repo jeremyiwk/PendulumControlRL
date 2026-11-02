@@ -1,5 +1,9 @@
 # PendulumControlRL
 
+![A trained network balancing the pendulum, with its phase space and control force](reports/stabilize_pendulum/simulation.gif)
+
+![Training cost, share of runs stabilized, and sampled train and test states over policy gradient training](reports/stabilize_pendulum/training.png)
+
 A neural network learns to balance an inverted pendulum on a moving fulcrum, using JAX,
 Equinox and Diffrax. The network maps the state directly to a force on the fulcrum along x.
 
