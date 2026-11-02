@@ -3,6 +3,7 @@ import jax.numpy as jnp
 import pytest
 
 from pendulumcontrol import (
+    LiveProximalPolicyTraining,
     OptimalControlPretraining,
     PendulumSimulation,
     PolicyGradientTraining,
@@ -13,6 +14,7 @@ from pendulumcontrol import (
     animate_simulation,
     integrator_path,
     is_stabilized,
+    plot_live_run,
     plot_training,
     run_training,
     simulate,
@@ -66,6 +68,32 @@ def test_integrator_path_applies_force_only_during_pulses():
     assert len(times) == len(states) == len(forces) == 3 * steps
     assert jnp.all(forces[SIMULATION.integrator_steps_with_force : steps] == 0)
     assert jnp.allclose(states[steps], trajectory.states[1])
+
+
+def test_live_training_is_one_continuous_run(tmp_path):
+    method = LiveProximalPolicyTraining(updates=4, steps=5, test_steps=5)
+    _, history = method.train(AGENT, SIMULATION, KEY)
+    live = history.live_trajectory
+    assert live is not None
+    assert live.states.shape == (21, 4)
+    next_states = jax.vmap(SIMULATION.step)(live.states[:-1], live.applied_forces)
+    assert jnp.allclose(next_states, live.states[1:], atol=1e-4)
+    assert not history.perturbation_updates
+    plot_live_run(history, SIMULATION, tmp_path / "live.png", minutes_per_bin=0.01)
+
+
+def test_live_training_perturbs_weights_when_triggered():
+    method = LiveProximalPolicyTraining(
+        updates=4,
+        steps=5,
+        test_steps=5,
+        perturbation_size=0.1,
+        perturbation_cost=-1.0,
+        perturbation_gradient=float("inf"),
+        perturbation_window=2,
+    )
+    _, history = method.train(AGENT, SIMULATION, KEY)
+    assert history.perturbation_updates == [2, 4]
 
 
 def test_animation_is_written(tmp_path):

@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+from collections import deque
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Protocol
@@ -9,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 
-from pendulumcontrol.agent import StateControlAgent
+from pendulumcontrol.agent import StateControl, StateControlAgent
 from pendulumcontrol.optimal_control import optimal_forces
 from pendulumcontrol.simulation import ANGLE, PendulumSimulation, wrap_angle
 from pendulumcontrol.trajectory import (
@@ -54,6 +55,10 @@ class TrainingHistory:
     test_loss: list[float] = field(default_factory=list)
     train_accuracy: list[float] = field(default_factory=list)
     test_accuracy: list[float] = field(default_factory=list)
+    live_trajectory: Trajectory | None = None
+    gradient_norms: list[float] = field(default_factory=list)
+    stretch_costs: list[float] = field(default_factory=list)
+    perturbation_updates: list[int] = field(default_factory=list)
 
     def record(
         self,
@@ -235,6 +240,28 @@ class TrajectoryTraining(ABC):
             return jax.vmap(run, (0, None))(initial_states, None)
         return jax.vmap(run)(initial_states, jax.random.split(key, len(initial_states)))
 
+    def create_optimizer(self) -> optax.GradientTransformation:
+        return optax.chain(
+            optax.clip_by_global_norm(self.gradient_limit),
+            optax.adam(
+                optax.cosine_decay_schedule(
+                    self.learning_rate, self.updates * self.optimizer_steps_per_update
+                )
+            ),
+        )
+
+    def evaluate(
+        self,
+        network: StateControl,
+        agent: StateControlAgent,
+        simulation: PendulumSimulation,
+        test_states: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        batch = self.collect(
+            agent.with_network(network), simulation, test_states, steps=self.test_steps
+        )
+        return self.measure(batch, agent.target_state)
+
     def measure(
         self, batch: Trajectory, target: jax.Array
     ) -> tuple[jax.Array, jax.Array]:
@@ -254,14 +281,7 @@ class TrajectoryTraining(ABC):
             test_key, self.test_trajectory_count, target
         )
         models = (agent.network, self.create_value_network(agent, value_key))
-        optimizer = optax.chain(
-            optax.clip_by_global_norm(self.gradient_limit),
-            optax.adam(
-                optax.cosine_decay_schedule(
-                    self.learning_rate, self.updates * self.optimizer_steps_per_update
-                )
-            ),
-        )
+        optimizer = self.create_optimizer()
         optimizer_state = optimizer.init(eqx.filter(models, eqx.is_inexact_array))
 
         @eqx.filter_jit
@@ -280,13 +300,7 @@ class TrajectoryTraining(ABC):
 
         @eqx.filter_jit
         def evaluate(network):
-            batch = self.collect(
-                agent.with_network(network),
-                simulation,
-                test_states,
-                steps=self.test_steps,
-            )
-            return self.measure(batch, target)
+            return self.evaluate(network, agent, simulation, test_states)
 
         history = TrainingHistory(
             self.name,
@@ -379,6 +393,7 @@ class ProximalPolicyTraining(TrajectoryTraining):
     value_hidden_size: int = 64
     value_hidden_layers: int = 2
     value_only_updates: int = 0
+    normalize_advantages: bool = True
 
     @property
     def optimizer_steps_per_update(self) -> int:
@@ -395,6 +410,28 @@ class ProximalPolicyTraining(TrajectoryTraining):
         )
 
     def update(
+        self,
+        models,
+        optimizer_state,
+        optimizer,
+        agent,
+        simulation,
+        initial_states,
+        update_index,
+        key,
+    ):
+        return self.update_and_measure_gradient(
+            models,
+            optimizer_state,
+            optimizer,
+            agent,
+            simulation,
+            initial_states,
+            update_index,
+            key,
+        )[:3]
+
+    def update_and_measure_gradient(
         self,
         models,
         optimizer_state,
@@ -432,9 +469,10 @@ class ProximalPolicyTraining(TrajectoryTraining):
         def loss(models, indices):
             network, value_network = models
             batch_advantages = advantages[indices]
-            batch_advantages = (batch_advantages - batch_advantages.mean()) / (
-                batch_advantages.std() + 1e-8
-            )
+            if self.normalize_advantages:
+                batch_advantages = (batch_advantages - batch_advantages.mean()) / (
+                    batch_advantages.std() + 1e-8
+                )
             log_probability = jax.vmap(agent.with_network(network).log_probability)(
                 states[indices], sampled[indices]
             )
@@ -456,7 +494,8 @@ class ProximalPolicyTraining(TrajectoryTraining):
             models, optimizer_state = apply_gradients(
                 models, gradients, optimizer, optimizer_state
             )
-            return (eqx.filter(models, eqx.is_inexact_array), optimizer_state), None
+            carry = eqx.filter(models, eqx.is_inexact_array), optimizer_state
+            return carry, optax.tree.norm(gradients[0])
 
         minibatch_size = len(states) // self.minibatch_count
         orders = jax.vmap(
@@ -465,10 +504,129 @@ class ProximalPolicyTraining(TrajectoryTraining):
         indices = orders[:, : minibatch_size * self.minibatch_count].reshape(
             -1, minibatch_size
         )
-        (parameters, optimizer_state), _ = jax.lax.scan(
+        (parameters, optimizer_state), gradient_norms = jax.lax.scan(
             minibatch_update, (parameters, optimizer_state), indices
         )
-        return eqx.combine(parameters, static), optimizer_state, batch
+        models = eqx.combine(parameters, static)
+        return models, optimizer_state, batch, jnp.mean(gradient_norms)
+
+
+@dataclass(frozen=True)
+class LiveProximalPolicyTraining(ProximalPolicyTraining):
+    """Learns during one continuous simulation that is never reset."""
+
+    name: str = "Live proximal policy optimization"
+    learning_rate: float = 3e-5
+    normalize_advantages: bool = False
+    perturbation_size: float = 0.0
+    perturbation_cost: float = 1.0
+    perturbation_gradient: float = 0.1
+    perturbation_window: int = 50
+
+    def create_optimizer(self) -> optax.GradientTransformation:
+        return optax.chain(
+            optax.clip_by_global_norm(self.gradient_limit),
+            optax.adam(self.learning_rate),
+        )
+
+    def perturb(self, network: StateControl, key: jax.Array) -> StateControl:
+        parameters, static = eqx.partition(network, eqx.is_inexact_array)
+        leaves, structure = jax.tree.flatten(parameters)
+        keys = jax.random.split(key, len(leaves))
+        leaves = [
+            leaf + self.perturbation_size * jax.random.normal(leaf_key, leaf.shape)
+            for leaf, leaf_key in zip(leaves, keys, strict=True)
+        ]
+        return eqx.combine(jax.tree.unflatten(structure, leaves), static)
+
+    def train(
+        self, agent: StateControlAgent, simulation: PendulumSimulation, key: jax.Array
+    ) -> tuple[StateControlAgent, TrainingHistory]:
+        value_key, test_key, start_key, key = jax.random.split(key, 4)
+        target = agent.target_state
+        test_states = self.state_range.sample(
+            test_key, self.test_trajectory_count, target
+        )
+        state = self.state_range.sample(start_key, 1, target)
+        models = (agent.network, self.create_value_network(agent, value_key))
+        optimizer = self.create_optimizer()
+        optimizer_state = optimizer.init(eqx.filter(models, eqx.is_inexact_array))
+
+        @eqx.filter_jit
+        def update(models, optimizer_state, state, index, update_key):
+            models, optimizer_state, batch, gradient_norm = (
+                self.update_and_measure_gradient(
+                    models,
+                    optimizer_state,
+                    optimizer,
+                    agent,
+                    simulation,
+                    state,
+                    index,
+                    update_key,
+                )
+            )
+            return (
+                models,
+                optimizer_state,
+                batch,
+                gradient_norm,
+                self.measure(batch, target),
+            )
+
+        @eqx.filter_jit
+        def evaluate(network):
+            return self.evaluate(network, agent, simulation, test_states)
+
+        history = TrainingHistory(
+            self.name,
+            "Mean cost per step",
+            "Stretches ending stabilized (train), runs stabilized (test)",
+            np.asarray(state),
+            np.asarray(test_states),
+        )
+        stretches = []
+        recent_costs = deque(maxlen=self.perturbation_window)
+        recent_gradients = deque(maxlen=self.perturbation_window)
+        for index, update_key in enumerate(jax.random.split(key, self.updates)):
+            step_key, perturbation_key = jax.random.split(update_key)
+            models, optimizer_state, batch, gradient_norm, measures = update(
+                models, optimizer_state, state, jnp.asarray(index), step_key
+            )
+            train_loss, train_accuracy = measures
+            state = batch.states[:, -1]
+            stretches.append(batch)
+            recent_costs.append(float(train_loss))
+            recent_gradients.append(float(gradient_norm))
+            history.gradient_norms.append(float(gradient_norm))
+            history.stretch_costs.append(float(train_loss))
+            if (
+                self.perturbation_size > 0
+                and len(recent_costs) == self.perturbation_window
+                and np.median(recent_costs) > self.perturbation_cost
+                and np.median(recent_gradients) < self.perturbation_gradient
+            ):
+                network = self.perturb(models[0], perturbation_key)
+                models = (network, models[1])
+                history.perturbation_updates.append(index + 1)
+                recent_costs.clear()
+                recent_gradients.clear()
+            if (index + 1) % self.evaluation_interval == 0 or index == 0:
+                test_loss, test_accuracy = evaluate(models[0])
+                history.record(
+                    index + 1, train_loss, test_loss, train_accuracy, test_accuracy
+                )
+        history.train_states = np.concatenate(
+            [np.asarray(stretch.states[0, :-1]) for stretch in stretches]
+        )
+        history.live_trajectory = Trajectory(
+            jnp.concatenate(
+                [stretch.states[0, :-1] for stretch in stretches] + [state]
+            ),
+            jnp.concatenate([stretch.sampled_controls[0] for stretch in stretches]),
+            jnp.concatenate([stretch.applied_forces[0] for stretch in stretches]),
+        )
+        return agent.with_network(models[0]), history
 
 
 @dataclass(frozen=True)

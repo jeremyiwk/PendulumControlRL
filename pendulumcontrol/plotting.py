@@ -155,6 +155,76 @@ def plot_method_comparison(
     plt.close(figure)
 
 
+def plot_live_run(
+    history: TrainingHistory,
+    simulation: PendulumSimulation,
+    path: str | Path,
+    upright_angle: float = 0.2,
+    minutes_per_bin: float = 5.0,
+) -> None:
+    assert history.live_trajectory is not None
+    states = np.asarray(history.live_trajectory.states)
+    steps_per_bin = round(minutes_per_bin * 60 / simulation.control_interval)
+    bin_count = len(states) // steps_per_bin
+    binned_angles = states[: bin_count * steps_per_bin, ANGLE].reshape(bin_count, -1)
+    upright = np.mean(np.abs(binned_angles) < upright_angle, axis=1)
+    bin_minutes = minutes_per_bin * (np.arange(bin_count) + 1)
+    minutes = simulation.control_interval * np.arange(len(states)) / 60
+    steps_per_update = (len(states) - 1) // len(history.stretch_costs)
+    perturbation_minutes = (
+        simulation.control_interval
+        * steps_per_update
+        * np.asarray(history.perturbation_updates)
+        / 60
+    )
+
+    updates_per_bin = max(1, steps_per_bin // steps_per_update)
+    costs = np.asarray(history.stretch_costs)
+    cost_bin_count = len(costs) // updates_per_bin
+    binned_costs = np.median(
+        costs[: cost_bin_count * updates_per_bin].reshape(cost_bin_count, -1), axis=1
+    )
+    cost_minutes = minutes_per_bin * (np.arange(cost_bin_count) + 1)
+
+    figure, (cost_axes, upright_axes, position_axes) = plt.subplots(
+        1, 3, figsize=(15, 3.8), layout="constrained"
+    )
+    cost_axes.set_title("Live cost")
+    cost_axes.plot(cost_minutes, binned_costs, color=SERIES[0], lw=LINE_WIDTH)
+    cost_axes.set(
+        xlabel="Simulated time (minutes)",
+        ylabel=f"Median cost per step, each {minutes_per_bin:g} minutes",
+        yscale="log",
+    )
+    upright_axes.set_title(f"Time within {upright_angle} rad of upright")
+    upright_axes.plot(bin_minutes, upright, color=SERIES[0], lw=LINE_WIDTH)
+    upright_axes.set(
+        xlabel="Simulated time (minutes)",
+        ylabel=f"Share of each {minutes_per_bin:g} minutes",
+        ylim=(-0.02, 1.02),
+    )
+    position_axes.set_title("Fulcrum distance from target")
+    position_axes.plot(
+        minutes, np.abs(states[:, POSITION]) + 1e-3, color=SERIES[0], lw=LINE_WIDTH
+    )
+    position_axes.set(
+        xlabel="Simulated time (minutes)", ylabel="Distance (m)", yscale="log"
+    )
+    for axes in (cost_axes, upright_axes, position_axes):
+        for index, minute in enumerate(perturbation_minutes):
+            axes.axvline(
+                minute,
+                color=TEXT_SECONDARY,
+                lw=0.5,
+                alpha=0.5,
+                label="Weight perturbation" if index == 0 else None,
+            )
+    if len(perturbation_minutes) > 0:
+        add_legend(position_axes)
+    figure.savefig(path, dpi=150)
+    plt.close(figure)
+
+
 def break_angle_jumps(angles: np.ndarray, velocities: np.ndarray) -> np.ndarray:
     """Returns phase space points with gaps where the angle wraps around."""
     points = np.stack([angles, velocities], axis=1)

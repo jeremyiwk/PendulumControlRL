@@ -24,6 +24,8 @@ The hook checks Ruff formatting, Ruff linting and Ty types on every commit.
 uv run python scripts/stabilize_pendulum.py         # learn from scratch, with a GIF
 uv run python scripts/compare_training_methods.py   # compare methods from scratch
 uv run python scripts/pretrain_then_train.py        # pretraining followed by training
+uv run python scripts/live_training.py              # learn during one run with no resets
+uv run python scripts/pretrain_then_live.py         # batch training, then learn during one run
 ```
 
 Output is written to `reports/`.
@@ -45,10 +47,14 @@ Training methods run in sequence and are interchangeable:
 | `PolicyGradientTraining` | Weights sampled controls by the reward that follows them |
 | `ProximalPolicyTraining` | Policy updates limited near the sampled policy, with a learned value network |
 | `SimulationGradientTraining` | Gradient of trajectory cost through the simulation itself |
+| `LiveProximalPolicyTraining` | Proximal policy updates during one continuous run, with optional random weight perturbations when cost is high and the gradient is small |
 | `OptimalControlPretraining` | Regression onto forces found by optimizing through the simulation |
 
 `SimulationGradientTraining` is unreliable with pulsed control and often fails to stabilize.
 `ProximalPolicyTraining` defaults to one optimizer step per batch.
+`LiveProximalPolicyTraining` has not stabilized the pendulum from scratch in a single run.
+From a network pre-trained with `PolicyGradientTraining`, it lowers cost near upright at first,
+but recovery from larger tilts degrades within hours and the pendulum can eventually fall.
 
 To add a method, subclass `TrajectoryTraining` and write `update`, or write any class with
 the `train` method of the `TrainingMethod` protocol.
